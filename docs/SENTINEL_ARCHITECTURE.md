@@ -3175,6 +3175,7 @@ A: Three ways: (1) The training log shows regression deltas at every probe inter
 4. **Increase warmup:** Set `warmup_steps=200` or higher. Longer warmup lets the model find non-conflicting gradient directions before protection engages.
 5. **Use adaptive mode:** Set `adaptive=True` — it will automatically reduce β if the target loss plateaus.
 
+
 ### "Training crashes with `shape mismatch` after modifying LoRA config"
 
 **Symptom:** `RuntimeError: shape mismatch` when using SentinelCallback.
