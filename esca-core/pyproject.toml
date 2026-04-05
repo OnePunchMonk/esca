@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esca-core"
+version = "0.0.1"
+description = "ESCA (Emergent Self-Correction Amplification) core library"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "ESCA contributors" }]
+dependencies = [
+  "numpy>=1.23",
+]
+
+[project.scripts]
+esca-detect = "esca.tools.detect_jsonl:main"
+
+[project.optional-dependencies]
+embeddings = [
+  "sentence-transformers>=2.7.0",
+]
+train = [
+  "transformers>=4.40.0",
+  "trl>=0.9.0",
+  "datasets>=2.19.0",
+]
+wandb = [
+  "wandb>=0.16.0",
+]
+test = [
+  "pytest>=8.0.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["esca*"]
