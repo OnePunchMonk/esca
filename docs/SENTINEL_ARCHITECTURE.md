@@ -1357,3 +1357,975 @@ At Level 100, the HTML audit report is a self-contained interactive document:
 8. **Appendix** — Full attribution tables, methodology details, reproducibility info
 
 ---
+
+# 9. Component VI — Data Surgeon
+
+## 9.1 What It Does
+
+The Data Surgeon takes audit results and *fixes the training data* so that retraining produces no regression. It is the remediation layer — the tool that closes the loop from diagnosis to cure.
+
+## 9.2 API
+
+```python
+from sentinel import DataSurgeon, SurgeryPlan
+
+surgeon = DataSurgeon(
+    audit_report=report,                    # From Component V
+    profile=profile,
+    
+    # Surgery config
+    max_removals: int = 500,               # Max examples to remove (budget)
+    max_target_task_cost: float = 0.02,    # Max acceptable target task performance loss
+    reweight_method: str = "influence",    # "influence" or "gradient_conflict"
+    
+    # Augmentation
+    augment_with_retention: bool = True,   # Add capability-preserving examples
+    retention_budget: int = 1000,          # Max retention examples to add
+    retention_source: str = "sentinel:standard",  # or path to custom retention dataset
+)
+
+plan: SurgeryPlan = surgeon.plan(training_data=sft_dataset)
+
+# Inspect the plan
+print(plan.summary())
+
+# Apply the plan
+cleaned_dataset = plan.apply(training_data=sft_dataset)
+
+# Or apply individual operations
+dataset_v2 = plan.remove_harmful(sft_dataset)          # Just remove harmful examples
+dataset_v3 = plan.reweight(sft_dataset)                 # Return dataset with per-example weights
+dataset_v4 = plan.augment_with_retention(sft_dataset)   # Add retention examples
+```
+
+## 9.3 Surgery Strategies
+
+### Strategy 1: Remove — Cut the problem examples
+
+Identify and remove the training examples with the highest negative influence on regressed capabilities. Fast and simple.
+
+```python
+# Removes top-k most harmful examples for each regressed capability
+# Deduplicates across capabilities (example harmful to both math and safety → removed once)
+# Validates that expected target task cost stays under budget
+```
+
+### Strategy 2: Reweight — Don't remove, just downweight
+
+For each example, compute an optimal loss weight that balances target task contribution against capability harm.
+
+```python
+# Per-example weight:
+# w_i = target_task_influence(i) / (1 + λ · Σ_C |regression_influence(i, C)|)
+#
+# Examples that help the target task AND don't harm capabilities → high weight
+# Examples that help the target task BUT harm capabilities → reduced weight
+# Examples that neither help nor harm → normal weight (1.0)
+```
+
+### Strategy 3: Augment — Add retention data to counteract regression
+
+Instead of removing training data, *add* capability-preserving examples to the training set.
+
+```python
+# For each regressed capability C:
+#   Sample N examples from C's eval set (or a larger retention dataset)
+#   These examples are added to the training set with a specified mixing ratio
+#   The goal: gradient from retention examples cancels out regression gradient
+
+sentinel augment-retention \
+    --audit-report audit.json \
+    --regressed-capabilities math,safety \
+    --budget 1000 \
+    --output augmented_dataset.jsonl
+```
+
+### Strategy 4: Smart Subset — Find the Pareto-optimal training set
+
+The most sophisticated strategy. Uses the influence scores from the audit to select the subset of training examples that maximizes target task performance while keeping all capability regressions below a threshold.
+
+```python
+# This is a multi-objective optimization:
+# max Σ_i w_i · target_task_influence(i)
+# s.t. Σ_i w_i · regression_influence(i, C) > -threshold_C  ∀ C ∈ Protected
+#      w_i ∈ {0, 1}  (for subset selection) or w_i ∈ [0, 1]  (for reweighting)
+#
+# Solved via greedy selection with constraint checking.
+```
+
+## 9.4 Retention Data Library
+
+Sentinel ships with curated retention datasets for common capabilities:
+
+| Capability | Retention Set | Size | Source |
+|---|---|---|---|
+| Math | `sentinel:retain-math-2k` | 2,000 | MATH training set (stratified) |
+| Code | `sentinel:retain-code-2k` | 2,000 | CodeAlpaca + MBPP |
+| Safety | `sentinel:retain-safety-1k` | 1,000 | Curated safety-preserving examples |
+| Reasoning | `sentinel:retain-reasoning-2k` | 2,000 | ARC + MMLU training subsets |
+| Factual | `sentinel:retain-factual-2k` | 2,000 | NQ + TriviaQA training subsets |
+| Instruction | `sentinel:retain-instruct-2k` | 2,000 | FLAN-v2 subset |
+
+Users can register custom retention sets.
+
+---
+
+# 10. CLI & Developer Experience
+
+## 10.1 CLI Overview
+
+```bash
+pip install sentinel-lm
+
+# The full workflow via CLI:
+sentinel profile    # Profile a model's capabilities
+sentinel predict    # Predict regression from training data
+sentinel train      # Train with protection (wraps your training command)
+sentinel audit      # Post-training regression audit
+sentinel surgery    # Fix training data based on audit results
+
+# Utilities
+sentinel inspect    # Inspect a profile, risk report, or audit report
+sentinel compare    # Compare two models or two audit reports
+sentinel ci         # Run in CI mode (exit code = regression severity)
+```
+
+## 10.2 Command Details
+
+### `sentinel profile`
+
+```bash
+sentinel profile \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --lora-r 16 \
+    --lora-target-modules q_proj,v_proj \
+    --capabilities math,code,safety,reasoning,factual,instruction \
+    --output profile.sentinel \
+    --push-to-hub my-org/qwen2.5-7b-profile \
+    --device cuda:0
+
+# Or with custom capabilities:
+sentinel profile \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --capabilities math,code \
+    --custom-capability medical:./medical_eval.jsonl \
+    --custom-capability legal:./legal_eval.jsonl \
+    --output profile.sentinel
+```
+
+### `sentinel predict`
+
+```bash
+sentinel predict \
+    --profile profile.sentinel \
+    --training-data ./training_data.jsonl \
+    --training-config '{"lr": 2e-5, "epochs": 3, "lora_r": 16}' \
+    --output risk_report.html \
+    --json risk_report.json \
+    --sample-size 1000
+
+# Quick check (text output only):
+sentinel predict --profile profile.sentinel --training-data ./data.jsonl --quick
+```
+
+### `sentinel train`
+
+```bash
+# Wraps your existing training command with Sentinel protection
+sentinel train \
+    --profile profile.sentinel \
+    --protect math:0.9,safety:1.0,code:0.5 \
+    --method gradient_projection \
+    --monitor-interval 50 \
+    --early-stop-threshold 0.10 \
+    --wandb-project my-project \
+    -- python train.py --config config.yaml   # Your existing training command
+```
+
+### `sentinel audit`
+
+```bash
+sentinel audit \
+    --profile profile.sentinel \
+    --model-before Qwen/Qwen2.5-7B-Instruct \
+    --model-after ./checkpoints/final \
+    --training-data ./training_data.jsonl \
+    --attribution lora_trak \
+    --output audit_report.html \
+    --push-to-hub my-org/model-audit-v1
+```
+
+### `sentinel surgery`
+
+```bash
+sentinel surgery \
+    --audit-report audit_report.json \
+    --training-data ./training_data.jsonl \
+    --strategy smart_subset \
+    --max-target-cost 0.02 \
+    --output cleaned_training_data.jsonl \
+    --output-weights example_weights.json
+```
+
+### `sentinel ci`
+
+```bash
+# For CI/CD pipelines — exits with non-zero code if regression exceeds threshold
+sentinel ci \
+    --profile profile.sentinel \
+    --model-before $BASE_MODEL \
+    --model-after ./checkpoints/final \
+    --max-regression 0.03 \
+    --capabilities math,safety,code
+
+# Exit codes:
+# 0: No regression exceeds threshold
+# 1: WARNING — regression between 50-100% of threshold
+# 2: FAILURE — regression exceeds threshold
+```
+
+## 10.3 Python SDK — Minimal Examples
+
+### The 5-Line Integration
+
+```python
+from sentinel import SentinelCallback
+
+trainer = SFTTrainer(
+    model=model, train_dataset=data,
+    callbacks=[SentinelCallback.auto(model, protect=["math", "safety"])],
+)
+trainer.train()
+```
+
+`SentinelCallback.auto()` downloads or computes the profile automatically, uses default protection settings, and logs to W&B.
+
+### Full Pipeline
+
+```python
+from sentinel import (
+    CapabilityProfiler, RegressionPredictor, SentinelCallback,
+    RegressionAuditor, DataSurgeon
+)
+
+# Phase 1: Profile
+profiler = CapabilityProfiler(model, tokenizer)
+profile = profiler.profile(capabilities={"math": "sentinel:math-500", "safety": "sentinel:safety-300"})
+
+# Phase 2: Predict
+predictor = RegressionPredictor(profile)
+risk = predictor.predict(training_data)
+print(risk)  # Shows predicted regression per capability
+
+# Phase 3: Train with Protection
+callback = SentinelCallback(profile, protect=["math", "safety"])
+trainer = SFTTrainer(model=model, train_dataset=data, callbacks=[callback])
+trainer.train()
+
+# Phase 4: Audit
+auditor = RegressionAuditor(profile)
+report = auditor.audit(model_before=base, model_after=model, training_data=data)
+report.to_html("audit.html")
+
+# Phase 5: Fix (if needed)
+surgeon = DataSurgeon(report, profile)
+cleaned_data = surgeon.plan(data).apply(data)
+```
+
+---
+
+# 11. Integration Layer
+
+## 11.1 Supported Frameworks
+
+| Framework | Integration Type | Status at Level 100 |
+|---|---|---|
+| **TRL** (SFTTrainer, DPOTrainer, GRPOTrainer) | `TrainerCallback` | First-class, fully tested |
+| **Transformers** (Trainer) | `TrainerCallback` | First-class, fully tested |
+| **Axolotl** | YAML plugin | `sentinel:` section in config, community PR |
+| **Unsloth** | Drop-in callback | Tested with FastLanguageModel |
+| **LLaMA-Factory** | Plugin | YAML integration via plugin system |
+| **PEFT** | Direct | All LoRA/QLoRA/DoRA configurations |
+| **DeepSpeed** | Custom engine wrapper | ZeRO-1/2/3 compatible |
+| **FSDP** | Custom callback | Gradient gather/scatter handled |
+| **vLLM** | Post-deployment monitoring | Monitor deployed model capabilities |
+
+## 11.2 Axolotl Integration (YAML-Driven)
+
+```yaml
+# axolotl config — add this section
+sentinel:
+  enabled: true
+  profile: sentinel-community/qwen2.5-7b-instruct-profile  # from Hub
+  protect:
+    math: 0.9
+    safety: 1.0
+    code: 0.5
+  method: gradient_projection
+  monitor: true
+  monitor_interval: 50
+  early_stop_threshold: 0.05
+  wandb_log: true
+  audit_on_complete: true     # Auto-run audit after training
+  audit_output: audit.html
+```
+
+## 11.3 Training Objective Support
+
+| Objective | Callback Hook | Gradient Access | Notes |
+|---|---|---|---|
+| **SFT** | `on_step_end` | Standard | Most straightforward |
+| **DPO** | `on_step_end` | Standard | Protection applies to full DPO gradient |
+| **RLHF/PPO** | `on_step_end` | Via trainer internals | Requires adapter for reward model interaction |
+| **GRPO/RLVR** | `on_step_end` | Via trainer internals | Protection applies to policy gradient |
+| **KTO** | `on_step_end` | Standard | Same as DPO pattern |
+| **ORPO** | `on_step_end` | Standard | Same as DPO pattern |
+
+## 11.4 Model Family Support
+
+Sentinel works with any model that supports LoRA/PEFT. Tested model families at Level 100:
+
+- Qwen2.5 (1.5B, 7B, 14B, 32B, 72B)
+- LLaMA 3.1/3.2 (1B, 3B, 8B, 70B)
+- Mistral/Mixtral (7B, 8x7B, 8x22B)
+- Gemma 2 (2B, 9B, 27B)
+- Phi-3/4 (3.8B, 14B)
+- DeepSeek-V2/V3 (Lite, Base)
+- Yi (6B, 9B, 34B)
+- Command-R (35B, 104B)
+- Qwen2.5-VL (VLM — multimodal support)
+- LLaVA-Next (VLM — multimodal support)
+
+---
+
+# 12. Observability & Reporting
+
+## 12.1 Logging Backends
+
+```python
+from sentinel.logging import configure_logging
+
+configure_logging(
+    # W&B (primary)
+    wandb_project="my-sentinel-project",
+    wandb_entity="my-org",
+    
+    # MLflow (alternative)
+    mlflow_uri="http://mlflow.internal:5000",
+    
+    # JSONL (always available, no dependencies)
+    jsonl_path="sentinel_log.jsonl",
+    
+    # Custom
+    custom_logger=my_logger_fn,
+)
+```
+
+## 12.2 Metrics Logged
+
+Every Sentinel run produces:
+
+**Pre-Training Metrics:**
+- Per-capability subspace effective rank
+- Pairwise capability overlap matrix
+- Risk scores per capability
+- Per-example risk contributions
+
+**During-Training Metrics (per step):**
+- Gradient norm (before and after projection)
+- Projection magnitude per capability
+- Effective β per capability (adaptive)
+- Target task loss
+- Per-capability loss delta (at probe intervals)
+- Representational drift magnitude per capability
+- Alert history
+
+**Post-Training Metrics:**
+- Per-capability accuracy delta (predicted vs. actual)
+- Attribution scores (top-k examples per capability)
+- Conflict analysis
+- Remediation plan details
+
+## 12.3 Report Formats
+
+| Format | Use Case | Generated By |
+|---|---|---|
+| **HTML** | Interactive, shareable, self-contained | `report.to_html()` |
+| **JSON** | Machine-readable, CI integration | `report.to_json()` |
+| **Markdown** | GitHub PRs, documentation | `report.to_markdown()` |
+| **PDF** | Formal auditing, compliance | `report.to_pdf()` |
+| **HF Hub** | Community sharing, model cards | `report.push_to_hub()` |
+| **W&B Artifact** | Experiment tracking | Automatic if W&B enabled |
+
+---
+
+# 13. Advanced Features (Level 80–100)
+
+These features build on the core pipeline and represent the fully mature system.
+
+## 13.1 Multi-Adapter Analysis
+
+When a model has multiple LoRA adapters (common in production), Sentinel can analyze interactions between them:
+
+```python
+from sentinel import MultiAdapterAnalyzer
+
+analyzer = MultiAdapterAnalyzer(model)
+interaction_report = analyzer.analyze(
+    adapters=["customer_support", "code_assist", "safety_filter"],
+    profile=profile,
+)
+# Shows: which adapters conflict, which capabilities each adapter affects,
+# and optimal adapter combination strategy
+```
+
+## 13.2 Model Merge Regression Prediction
+
+Before merging two fine-tuned models (via TIES, DARE, SLERP, etc.), predict capability regression of the merged model:
+
+```python
+from sentinel import MergePredictor
+
+predictor = MergePredictor(profile)
+merge_risk = predictor.predict_merge(
+    model_a=model_a,
+    model_b=model_b,
+    merge_method="ties",
+    merge_weight=0.5,
+)
+# Shows: predicted capabilities of merged model without actually merging
+```
+
+## 13.3 Continual Learning Support
+
+Track capability regression across multiple sequential fine-tuning sessions:
+
+```python
+from sentinel import ContinualTracker
+
+tracker = ContinualTracker(profile)
+
+# Session 1: Fine-tune on customer support
+tracker.before_session("customer_support")
+train_session_1(model)
+tracker.after_session("customer_support", model)
+
+# Session 2: Fine-tune on code
+tracker.before_session("code_assist")
+train_session_2(model)
+tracker.after_session("code_assist", model)
+
+# Full report across all sessions
+tracker.report()
+# Shows: cumulative degradation, which session caused which regression,
+# total capability drift from original model
+```
+
+## 13.4 VLM (Vision-Language Model) Support
+
+For multimodal models, Sentinel profiles visual and language capabilities separately:
+
+```python
+profiler = CapabilityProfiler(vlm_model, tokenizer)
+profile = profiler.profile(
+    capabilities={
+        "visual_qa": "sentinel:vqa-v2-500",
+        "chart_reading": "sentinel:chartqa-200",
+        "ocr": "sentinel:docvqa-200",
+        "visual_reasoning": "sentinel:mathvista-300",
+        "text_math": "sentinel:math-500",           # Language-only
+        "text_code": "sentinel:humaneval-164",       # Language-only
+    }
+)
+# Profiles visual-pathway and language-pathway subspaces separately
+# Can protect visual capabilities while fine-tuning language, or vice versa
+```
+
+## 13.5 Safety-Specific Protections
+
+Hardened mode for safety-critical fine-tuning:
+
+```python
+callback = SentinelCallback(
+    profile=profile,
+    protect={"safety": 1.0},           # Full protection
+    method="hybrid",                    # Strongest method
+    
+    # Safety hardening
+    safety_mode=True,
+    safety_probe_interval=10,          # Probe every 10 steps (not 50)
+    safety_early_stop_threshold=0.02,  # Much tighter threshold
+    safety_audit_on_stop=True,         # If early-stopped, auto-audit
+    safety_require_human_review=True,  # Don't release model without human sign-off
+)
+```
+
+## 13.6 Automated Capability Discovery
+
+Instead of the user specifying which capabilities to protect, automatically discover the model's capability clusters:
+
+```python
+from sentinel import CapabilityDiscovery
+
+discovery = CapabilityDiscovery(model, tokenizer)
+auto_profile = discovery.discover(
+    probe_dataset="sentinel:diverse-10k",  # Large, diverse eval set
+    n_clusters=10,                          # Discover ~10 capability clusters
+    method="gradient_clustering",           # Cluster by gradient similarity
+)
+# Returns: auto-discovered capabilities like "arithmetic", "logical_reasoning",
+#           "entity_recall", "instruction_format", etc.
+# Each with a computed subspace — no manual capability definition needed
+```
+
+## 13.7 Regression CI/CD Pipeline
+
+GitHub Actions integration for automated regression testing:
+
+```yaml
+# .github/workflows/sentinel-regression.yml
+name: Sentinel Regression Check
+on:
+  pull_request:
+    paths: ['training_data/**', 'configs/**']
+
+jobs:
+  regression-check:
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: sentinel-lm/sentinel-action@v1
+        with:
+          profile: sentinel-community/qwen2.5-7b-instruct-profile
+          training-data: ./training_data/
+          max-regression: 0.03
+          capabilities: math,safety,code
+          comment-on-pr: true    # Post risk report as PR comment
+```
+
+## 13.8 Federated Calibration
+
+Community-powered calibration model improvement:
+
+```python
+from sentinel import CalibrationContributor
+
+# After a training run with Sentinel:
+contributor = CalibrationContributor()
+contributor.contribute(
+    risk_report=risk_report,     # Predicted regression
+    audit_report=audit_report,   # Actual regression
+    # Only shares: model family, LoRA config, risk scores, actual deltas
+    # Does NOT share: training data, model weights, eval data
+)
+# Improves prediction accuracy for everyone using Sentinel
+```
+
+---
+
+# 14. Evaluation & Benchmarks
+
+## 14.1 Sentinel Benchmark Suite: `sentinel-bench`
+
+A standardized benchmark for evaluating regression prevention methods.
+
+| Track | What It Measures | Metric |
+|---|---|---|
+| **PredictionAccuracy** | How well does the predictor estimate actual regression? | R² of predicted vs. actual Δ accuracy |
+| **ProtectionEfficiency** | How well does protection prevent regression? | Regression prevented (%) at target task cost (%) |
+| **AttributionQuality** | How accurately does attribution identify harmful examples? | Precision@k of harmful example identification |
+| **ComputeOverhead** | What is the wall-clock cost of Sentinel? | % overhead vs. unprotected training |
+
+### PredictionAccuracy Benchmark
+
+```bash
+sentinel-bench prediction \
+    --models qwen2.5-7b,llama3.1-8b,mistral-7b \
+    --training-scenarios sft-customer,sft-code,dpo-safety \
+    --output prediction_accuracy.html
+```
+
+Tests: profile model → predict regression → train → measure actual regression → compute R².
+
+### ProtectionEfficiency Benchmark
+
+```bash
+sentinel-bench protection \
+    --model qwen2.5-7b \
+    --training-data customer_support.jsonl \
+    --methods projection,ewc_subspace,replay_mix,hybrid \
+    --beta-range 0.0,0.3,0.5,0.8,1.0 \
+    --output protection_efficiency.html
+```
+
+Tests: train with each method at each β → measure regression prevented vs. target task cost → plot Pareto frontier.
+
+## 14.2 Baselines
+
+Sentinel-bench includes implementations of comparison methods:
+
+| Method | Description | Source |
+|---|---|---|
+| **No Protection** | Standard fine-tuning baseline | — |
+| **EWC (Full Fisher)** | Elastic Weight Consolidation with diagonal Fisher | Kirkpatrick et al. 2017 |
+| **L2 Regularization** | Penalize parameter distance from base model | Standard |
+| **Replay Buffer** | Mix retention data into training | Standard continual learning |
+| **OGD** | Orthogonal Gradient Descent | Farajtabar et al. 2020 |
+| **NEFTune** | Noise injection during fine-tuning | Jain et al. 2023 |
+| **Sentinel** | Full Sentinel pipeline | This work |
+
+---
+
+# 15. Research Program
+
+## 15.1 Paper 1: Prediction
+
+**Title:** "Don't Train Blind: Predicting Post-Training Capability Regression from Data-Model Geometry"
+
+**Core claim:** Before any gradient update, gradient subspace overlap between training data and capability eval sets predicts capability regression with R² > 0.7 across model families.
+
+**Experiments:**
+- 5 model families × 5 fine-tuning scenarios × 3 training configs = 75 training runs
+- Per-capability prediction accuracy
+- Ablation: subspace rank, sample size, embedding method
+- Scaling: does prediction accuracy improve or degrade with model size?
+
+**Venue target:** ICML 2027
+
+## 15.2 Paper 2: Prevention
+
+**Title:** "Surgical Fine-Tuning: Gradient Projection in LoRA Subspace for Regression-Free Post-Training"
+
+**Core claim:** Gradient projection in LoRA subspace prevents capability regression at <3% target task cost, outperforming EWC, L2, and replay by 2–5x on the protection-vs-cost Pareto frontier.
+
+**Experiments:**
+- Protection efficiency benchmark across methods
+- Pareto frontier plots
+- Ablation: projection rank, adaptive β scheduling, warmup
+- DeepSpeed/multi-GPU scaling experiments
+
+**Venue target:** NeurIPS 2027
+
+## 15.3 Paper 3: Attribution
+
+**Title:** "Which Examples Broke Your Model? Per-Example Regression Attribution via LoRA Influence Functions"
+
+**Core claim:** LoRA-TRAK identifies the top 5% of training examples responsible for >80% of capability regression. Removing them recovers capability with <1% target task loss.
+
+**Experiments:**
+- Attribution accuracy on planted-influence benchmark
+- Real-world case studies: customer support, code, medical fine-tuning
+- Comparison vs. gradient cosine, TracIn, full-model TRAK
+- Scaling: attribution quality vs. training set size
+
+**Venue target:** ICLR 2028
+
+## 15.4 Open Research Questions
+
+1. **Subspace stability across training:** Do capability subspaces shift during training? If the base model's subspace changes as LoRA adapts, the initial profile becomes stale. How often should you re-profile?
+
+2. **Capability entanglement:** What happens when two capabilities share significant subspace overlap (e.g., math and logical reasoning)? Can you protect one without affecting the other?
+
+3. **Scaling behavior:** Does the capability subspace hypothesis hold at 70B+ scale? Do larger models have more orthogonal capability subspaces (which would make Sentinel more effective) or more entangled ones?
+
+4. **Full-parameter fine-tuning:** Sentinel is designed for LoRA. Can the same approach work for full-parameter fine-tuning using randomized gradient projection?
+
+5. **DPO-specific regression:** DPO fine-tuning has different gradient dynamics than SFT (preference pairs vs. next-token prediction). Does regression prediction need DPO-specific calibration?
+
+6. **Online vs. offline profiling:** Can you profile during training rather than before? (Online profiling would catch capabilities that emerge from fine-tuning itself.)
+
+---
+
+# 16. Repository Structure
+
+```
+sentinel/
+├── sentinel-core/                          # Python library
+│   ├── sentinel/
+│   │   ├── __init__.py
+│   │   ├── profiler/                       # Capability Profiler
+│   │   │   ├── __init__.py
+│   │   │   ├── profiler.py                 # CapabilityProfiler class
+│   │   │   ├── subspace.py                 # SVD, randomized SVD, subspace ops
+│   │   │   ├── capability_sets.py          # Built-in capability definitions
+│   │   │   ├── profile.py                  # CapabilityProfile dataclass + serialization
+│   │   │   └── tests/
+│   │   ├── predictor/                      # Regression Predictor
+│   │   │   ├── __init__.py
+│   │   │   ├── predictor.py                # RegressionPredictor class
+│   │   │   ├── risk_report.py              # RiskReport dataclass
+│   │   │   ├── calibrator.py              # RegressionCalibrator
+│   │   │   ├── gradient_estimation.py      # Training data gradient subspace estimation
+│   │   │   └── tests/
+│   │   ├── optimizer/                      # Constrained Optimizer
+│   │   │   ├── __init__.py
+│   │   │   ├── callback.py                 # SentinelCallback class
+│   │   │   ├── projection.py               # Gradient projection methods
+│   │   │   ├── ewc_subspace.py             # Subspace-aware EWC
+│   │   │   ├── replay.py                   # Replay mix method
+│   │   │   ├── adaptive.py                 # Adaptive β scheduling
+│   │   │   └── tests/
+│   │   ├── monitor/                        # Live Monitor
+│   │   │   ├── __init__.py
+│   │   │   ├── monitor.py                  # LiveMonitor class
+│   │   │   ├── probes.py                   # Loss, generation, drift probes
+│   │   │   ├── alerts.py                   # Alert system
+│   │   │   └── tests/
+│   │   ├── auditor/                        # Post-Training Auditor
+│   │   │   ├── __init__.py
+│   │   │   ├── auditor.py                  # RegressionAuditor class
+│   │   │   ├── attribution/
+│   │   │   │   ├── lora_trak.py            # LoRA-TRAK influence functions
+│   │   │   │   ├── gradient_cosine.py      # Fast gradient cosine attribution
+│   │   │   │   └── datainf.py              # DataInf method
+│   │   │   ├── report.py                   # AuditReport dataclass
+│   │   │   ├── html_report.py              # Interactive HTML report generator
+│   │   │   └── tests/
+│   │   ├── surgeon/                        # Data Surgeon
+│   │   │   ├── __init__.py
+│   │   │   ├── surgeon.py                  # DataSurgeon class
+│   │   │   ├── strategies.py               # Remove, reweight, augment, smart_subset
+│   │   │   ├── retention_data.py           # Built-in retention datasets
+│   │   │   └── tests/
+│   │   ├── integrations/                   # Framework integrations
+│   │   │   ├── __init__.py
+│   │   │   ├── trl.py                      # TRL SFTTrainer/DPOTrainer/GRPOTrainer
+│   │   │   ├── axolotl.py                  # Axolotl plugin
+│   │   │   ├── unsloth.py                  # Unsloth compatibility
+│   │   │   ├── llama_factory.py            # LLaMA-Factory plugin
+│   │   │   ├── deepspeed.py                # DeepSpeed ZeRO hooks
+│   │   │   ├── fsdp.py                     # PyTorch FSDP hooks
+│   │   │   └── tests/
+│   │   ├── logging/                        # Observability
+│   │   │   ├── __init__.py
+│   │   │   ├── wandb_logger.py
+│   │   │   ├── mlflow_logger.py
+│   │   │   ├── jsonl_logger.py
+│   │   │   └── metrics.py
+│   │   ├── hub/                            # HuggingFace Hub integration
+│   │   │   ├── __init__.py
+│   │   │   ├── profile_hub.py              # Push/pull profiles
+│   │   │   ├── report_hub.py               # Push/pull reports
+│   │   │   └── model_card.py               # Auto-generate model cards
+│   │   ├── cli/                            # CLI tools
+│   │   │   ├── __init__.py
+│   │   │   ├── main.py                     # Click/Typer CLI entry point
+│   │   │   ├── profile_cmd.py
+│   │   │   ├── predict_cmd.py
+│   │   │   ├── audit_cmd.py
+│   │   │   ├── surgery_cmd.py
+│   │   │   └── ci_cmd.py
+│   │   └── utils/                          # Shared utilities
+│   │       ├── lora_utils.py               # LoRA gradient extraction helpers
+│   │       ├── svd_utils.py                # Randomized SVD, incremental SVD
+│   │       ├── data_utils.py               # Stratified sampling, batching
+│   │       └── types.py                    # Shared type definitions
+│   ├── pyproject.toml
+│   └── README.md
+│
+├── sentinel-bench/                         # Benchmark suite
+│   ├── benchmarks/
+│   │   ├── prediction_accuracy/
+│   │   ├── protection_efficiency/
+│   │   ├── attribution_quality/
+│   │   └── compute_overhead/
+│   ├── baselines/
+│   │   ├── ewc.py
+│   │   ├── l2_reg.py
+│   │   ├── replay.py
+│   │   └── ogd.py
+│   └── README.md
+│
+├── sentinel-data/                          # Curated datasets
+│   ├── capability_eval_sets/               # Built-in eval sets
+│   ├── retention_sets/                     # Built-in retention data
+│   └── calibration/                        # Calibration data for predictor
+│
+├── experiments/                            # Research experiment configs
+│   ├── configs/
+│   ├── scripts/
+│   └── results/
+│
+├── docs/                                   # Documentation
+│   ├── quickstart.md
+│   ├── tutorials/
+│   ├── api_reference/
+│   └── paper/                              # LaTeX source
+│
+├── .github/
+│   ├── workflows/
+│   │   ├── ci.yml
+│   │   ├── benchmark.yml
+│   │   └── publish.yml
+│   └── ISSUE_TEMPLATE/
+│
+├── CONTRIBUTING.md
+├── ROADMAP.md
+└── README.md
+```
+
+---
+
+# 17. Roadmap — Level 0 → 100
+
+## Phase 1: Foundation (Level 0 → 20) — Weeks 1–4
+
+**Goal:** Validate the capability subspace hypothesis and build a minimal working pipeline.
+
+| Week | Deliverable | Level |
+|---|---|---|
+| 1 | `CapabilityProfiler` — compute subspaces for 5 capabilities on Qwen2.5-7B. Validate subspace quality (effective rank, variance explained). | 5 |
+| 2 | `RegressionPredictor` — compute risk scores. Run 5 training experiments and measure correlation between predicted and actual regression. **Kill switch: R² < 0.3 → hypothesis is wrong.** | 10 |
+| 3 | `SentinelCallback` — gradient projection, basic monitoring. Run protected vs. unprotected training comparison. | 15 |
+| 4 | `RegressionAuditor` with gradient cosine attribution. HTML report. End-to-end pipeline demo: profile → predict → protect → audit. | 20 |
+
+**Exit criteria:** Predicted regression correlates with actual regression (R² > 0.5). Protection reduces regression by >50% at <5% target task cost.
+
+## Phase 2: Hardening (Level 20 → 50) — Weeks 5–10
+
+| Week | Deliverable | Level |
+|---|---|---|
+| 5–6 | LoRA-TRAK attribution. DataSurgeon with remove + reweight strategies. CLI tools (profile, predict, audit, surgery). | 30 |
+| 7–8 | Multi-model validation: LLaMA 3.1 8B, Mistral 7B, Phi-3 3.8B. Adaptive β scheduling. EWC subspace and replay mix methods. | 40 |
+| 9–10 | Axolotl + Unsloth integrations. W&B dashboard. Prediction calibration model. PyPI release: `sentinel-lm v0.1.0`. | 50 |
+
+**Exit criteria:** Works across 4 model families. DockerFile and CI green. 3 integration targets working. PyPI installable.
+
+## Phase 3: Community (Level 50 → 75) — Weeks 11–18
+
+| Week | Deliverable | Level |
+|---|---|---|
+| 11–12 | `sentinel-bench` benchmark suite. Baseline comparisons (EWC, L2, replay, OGD). Paper 1 draft. | 60 |
+| 13–14 | DeepSpeed ZeRO-3 support. Multi-GPU testing. 70B model support. DPO/KTO/ORPO training objective support. | 65 |
+| 15–16 | HuggingFace Hub integration (profile sharing, report sharing). Community profile registry. `sentinel ci` for GitHub Actions. | 70 |
+| 17–18 | Paper 1 submission. HuggingFace blog post. Community: good-first-issues, Discord, contributor guide. | 75 |
+
+**Exit criteria:** Paper submitted. 100+ GitHub stars. 3+ community contributors. Works at 70B scale.
+
+## Phase 4: Advanced (Level 75 → 100) — Months 5–8
+
+| Month | Deliverable | Level |
+|---|---|---|
+| 5 | Multi-adapter analysis. Model merge regression prediction. Continual learning tracker. | 80 |
+| 6 | VLM support (Qwen2.5-VL, LLaVA-Next). Automated capability discovery. Safety hardened mode. | 85 |
+| 7 | Federated calibration. CI/CD GitHub Action. Paper 2 (prevention) draft. Smart subset data surgery. | 90 |
+| 8 | Paper 2 submission. Full API stabilization. `sentinel-lm v1.0.0`. LLaMA-Factory integration. Comprehensive docs. Paper 3 (attribution) draft. | 100 |
+
+---
+
+# Appendix A — Mathematical Foundations
+
+## A.1 Subspace Projection in LoRA Space
+
+Let a LoRA-adapted model have parameters θ = θ_base + BA, where B ∈ ℝ^{d×r} and A ∈ ℝ^{r×d} are the low-rank adaptation matrices. The effective LoRA parameter vector is:
+
+```
+θ_LoRA = vec(B) ⊕ vec(A) ∈ ℝ^{2dr}
+```
+
+For a capability C with eval set E_C = {x_1, ..., x_n}, the capability gradient matrix is:
+
+```
+G_C = [∇_{θ_LoRA} L(x_1), ..., ∇_{θ_LoRA} L(x_n)] ∈ ℝ^{2dr × n}
+```
+
+The SVD of G_C gives:
+
+```
+G_C = U_C Σ_C V_C^T
+```
+
+The capability subspace S_C is spanned by the columns of U_C[:, :k], i.e., the top-k left singular vectors. These are the directions in LoRA parameter space that most affect capability C.
+
+## A.2 Risk Prediction
+
+For training data D with gradient matrix G_D (estimated from a sample), the regression risk is:
+
+```
+Risk(C, D) = ||U_C[:,:k]^T G_D||_F / ||G_D||_F = tr(G_D^T P_C G_D) / tr(G_D^T G_D)
+```
+
+where P_C = U_C[:,:k] U_C[:,:k]^T is the projection operator onto S_C.
+
+This equals the fraction of training gradient variance that lies within the capability subspace.
+
+## A.3 Protected Gradient
+
+The protected gradient at each training step is:
+
+```
+g̃ = g - Σ_{C ∈ Protected} β_C · P_C g = (I - Σ_C β_C P_C) g
+```
+
+When β_C = 1 for all C, this is the orthogonal complement projection:
+
+```
+g̃ = (I - P_{union}) g
+```
+
+where P_{union} is the projector onto the union of all protected subspaces.
+
+**Note:** If protected subspaces overlap, sequential projection (project out C_1, then C_2) differs from joint projection (project out span(C_1 ∪ C_2)). Sentinel uses joint projection (via QR decomposition of concatenated bases) to avoid over-projection.
+
+## A.4 Influence Functions in LoRA Subspace
+
+The influence of training example z_i on capability C is:
+
+```
+I(z_i, C) = -1/n · ∇_θ L(E_C)^T · H^{-1}_θ · ∇_θ L(z_i)
+```
+
+Where H_θ is the Hessian of the training loss. The DataInf approximation replaces H^{-1} with:
+
+```
+H^{-1} ≈ diag(F + λI)^{-1}
+```
+
+where F is the diagonal Fisher information and λ is a damping term. In LoRA subspace:
+- F has dimension 2dr (not d_model²)
+- The diagonal approximation is more accurate because LoRA parameters are approximately independent
+- Computation is O(2dr × n_train) — feasible on a single GPU
+
+---
+
+# Appendix B — Failure Modes
+
+| Failure Mode | What Happens | Detection | Mitigation | Severity |
+|---|---|---|---|---|
+| **Subspace Drift** | Capability subspaces shift during training, making the initial profile stale | Monitor drift between current model's gradient subspace and stored profile using `subspace_angle` metric | Re-profile every N steps (expensive) or detect when subspace angle exceeds threshold and freeze protection | MEDIUM |
+| **Entangled Capabilities** | Two capabilities share subspace — protecting one constrains the other | Overlap matrix in profile shows high overlap (>0.5) | Use EWC (penalty, not projection) for entangled capabilities, or accept coupled protection | MEDIUM |
+| **Target-Capability Collision** | Target task gradient lies entirely within a protected capability's subspace | Risk report shows high overlap + high protection cost | Reduce β for that capability, or use replay instead of projection | HIGH |
+| **Calibration Failure** | Predicted regression magnitude is systematically off | `audit.compare_to_prediction()` shows high prediction error | Re-fit calibrator on user's own runs; switch to ordinal risk (HIGH/LOW) instead of cardinal (-7.2%) | LOW |
+| **Attribution Noise** | Influence scores are dominated by noise rather than signal | Low confidence scores in attribution results; random permutation test shows no separation from noise | Increase Fisher samples, switch to LoRA-TRAK from gradient cosine, or increase training data sample size | MEDIUM |
+| **Sparse SCE Subspaces** | Capability has very low effective rank — subspace is too small to meaningfully protect | Profile shows effective_rank < 3 for a capability | This capability may not have a coherent gradient structure. Remove from protection or use replay | LOW |
+
+---
+
+# Appendix C — Competitive Landscape
+
+## C.1 Existing Tools
+
+| Tool/Method | What It Does | Gap | Why Sentinel Is Better |
+|---|---|---|---|
+| **EWC** (Kirkpatrick 2017) | Penalizes parameter changes using Fisher diagonal | Full-model Fisher is expensive. Diagonal is coarse. Not targeted to specific capabilities. | Sentinel: subspace-aware, capability-targeted, LoRA-native |
+| **OGD** (Farajtabar 2020) | Projects gradients orthogonal to previous tasks | Requires storing task-specific gradient subspaces from previous training. No prediction, no attribution. | Sentinel: profiles before training, predicts, attributes, remediates |
+| **lm-eval-harness** | Comprehensive eval suite | Post-hoc only. No prediction, no prevention, no attribution. | Sentinel can consume lm-eval results but adds prediction and prevention |
+| **DataInf** (Kwon 2023) | Per-example influence for LoRA | Attribution only. No profile, no prediction, no protection. | Sentinel integrates DataInf as one attribution method in a full pipeline |
+| **TRAK** (Park 2023) | Efficient influence functions | Not adapted for generative models or LoRA specifically | Sentinel's LoRA-TRAK extends TRAK to generative LoRA setting |
+| **NEFTune** (Jain 2023) | Noise injection during embedding | Untargeted — may help or hurt random capabilities | Sentinel: targeted protection of specific capabilities |
+| **Replay/data mixing** | Mix retention data into training | How much? From which distribution? No systematic way to decide. | Sentinel's Data Surgeon recommends exactly how much and which retention data |
+
+## C.2 Why Nothing Like Sentinel Exists Yet
+
+1. **The LoRA tractability gap was not obvious.** Influence functions and subspace analysis were considered intractable for LLMs. The key insight — that LoRA makes the parameter space small enough for these tools — has only been recently demonstrated (DataInf, TRAK for LoRA).
+
+2. **Evaluation vs. prevention is underexplored.** The field has invested heavily in post-hoc evaluation (benchmarks, leaderboards) but almost nothing in pre-training prediction or during-training prevention. This is the tooling gap.
+
+3. **Capability regression is treated as inevitable.** The industry default is "fine-tune, evaluate, accept trade-offs." Nobody has shown that targeted prevention can make the trade-off disappear.
+
+4. **The community that needs this most (production ML teams) doesn't publish papers.** Academic researchers fine-tune on clean benchmarks where regression is manageable. Production teams fine-tune on messy domain data where regression is severe. The pain is real but unpublished.
+
+---
+
+*Sentinel Architecture Document v1.0 — April 2026*
+*Level 0. Everything is ahead.*
+
