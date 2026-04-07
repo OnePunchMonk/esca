@@ -461,7 +461,23 @@ Five technical enablers converged to make Sentinel possible:
 | **ML Platform Team** building fine-tuning infrastructure | Automated regression CI in their pipeline | `sentinel ci` |
 | **Researcher** studying catastrophic forgetting | Precise tools for measuring and attributing regression | `sentinel audit` |
 
-## 1.4 What Sentinel Is Not
+## 1.4 "Why Should I Care About Math If I'm Building a Customer Support Bot?"
+
+A common — and valid — objection: if you're fine-tuning for a single domain, why protect unrelated capabilities?
+
+**Short answer:** You don't have to. Sentinel lets you choose. But here's why you should think carefully before choosing "nothing":
+
+**Hidden dependencies.** Your customer support model still reasons ("if the order was placed 15 days ago and the return window is 14 days..."), follows instructions ("always respond in JSON, never reveal internal pricing"), and needs to be honest ("no, that coupon is expired" instead of "sure, let me apply that for you!"). These are "math," "instruction following," and "safety" — capabilities that silently degrade during fine-tuning on conversational data. Every horror story in Section 2 is a team that didn't know their task depended on a general capability until it broke in production.
+
+**The prediction is more valuable than the protection.** Even if you protect nothing, `sentinel predict` tells you exactly what changed in your model and which training examples caused those changes. That diagnostic alone prevents the $200-compute, 3-day debugging cycle. You might discover your customer support data contains 800 examples where the agent says "you're absolutely right!" to factually wrong customer claims — that's a data quality problem Sentinel surfaces for free.
+
+**For truly single-task, narrow deployments:** If you validate that your model does exactly what you need and nothing else matters, then skip protection entirely. Use Sentinel for prediction and auditing only. The tool adapts to your risk tolerance — it doesn't impose one.
+
+**The right framing:** Sentinel's value isn't "protect everything." It's **"know what will break, know what your task actually needs, protect the intersection, and diagnose what went wrong."**
+
+**Sentinel answers this automatically.** The `sentinel predict` command includes a **Capability Dependency Analysis** that tells you exactly which general capabilities your task relies on, scored from 0 to 1. A customer support task might show: instruction-following (0.72), reasoning (0.41), safety (0.38), math (0.09), code (0.02). You protect what's both at-risk AND needed — not everything, not nothing. See Section 5.2.1 for the `auto-protect` API that does this in one line. General benchmark numbers from model release pages tell you how good a model is in aggregate — they don't tell you which of those capabilities *your specific task* depends on, or which ones *your specific training data* will damage.
+
+## 1.5 What Sentinel Is Not
 
 - **Not a training framework.** Sentinel hooks into existing frameworks (TRL, Axolotl, Unsloth). It doesn't replace them.
 - **Not a benchmark suite.** Sentinel uses benchmarks but doesn't compete with lm-eval-harness. It consumes eval results, not produces them.
@@ -970,7 +986,71 @@ print(risk_report)
 ║    #9,823  "The discount code SAVE20..."     contributes 1.2%  ║
 ║    #3,115  "Here's how to reset your..."     contributes 0.9%  ║
 ║                                                                ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                ║
+║  CAPABILITY DEPENDENCY ANALYSIS                                ║
+║  "Which general capabilities does your task actually need?"    ║
+║                                                                ║
+║  Capability       Dependency   Why                             ║
+║  ──────────────────────────────────────────────────────         ║
+║  instruction      STRONG 0.72  Task gradient heavily overlaps  ║
+║                                instruction-following subspace  ║
+║                                → your model NEEDS this to      ║
+║                                follow CS response formats      ║
+║  reasoning        MODERATE 0.41 Refund calculations, policy    ║
+║                                conditionals, multi-step logic  ║
+║  safety           MODERATE 0.38 Honesty, refusal to fabricate  ║
+║                                policies, escalation behavior   ║
+║  factual          WEAK 0.12    Some factual grounding but      ║
+║                                task is mostly procedural       ║
+║  math             WEAK 0.09    Minimal arithmetic required     ║
+║  code             NONE 0.02    No code generation needed       ║
+║                                                                ║
+║  AUTO-PROTECT RECOMMENDATION:                                  ║
+║  Based on dependency analysis, protect: instruction (β=0.9),   ║
+║  reasoning (β=0.7), safety (β=0.8). Skip: math, code, factual ║
+║                                                                ║
 ╚══════════════════════════════════════════════════════════════════╝
+```
+
+**This answers the "why should I care about math?" question directly.** You shouldn't — Sentinel tells you that your customer support task depends on instruction following, reasoning, and safety, not math or code. Protect what matters, ignore what doesn't.
+
+The dependency score is computed from the same subspace overlap math, but interpreted differently:
+- **Risk** = "how much will this capability be damaged by training?" (training gradient → capability subspace)
+- **Dependency** = "how much does your task's *performance* rely on this capability?" (task gradient → capability subspace, measured by how much the target task's loss changes when the capability subspace is perturbed)
+
+A capability can be HIGH risk but LOW dependency (math gets damaged but your task doesn't need it — who cares) or LOW risk but HIGH dependency (instruction-following won't be damaged much, but if it were, your task would break).
+
+**The key insight: Risk × Dependency = what you should actually protect.**
+
+## 5.2.1 Dependency-Aware Protection (Auto-Protect)
+
+```python
+# Instead of manually guessing which capabilities to protect:
+callback = SentinelCallback(profile, protect=["math", "safety", "code"])  # ← guessing
+
+# Let Sentinel figure it out from your task data:
+risk = predictor.predict(training_data)
+callback = SentinelCallback.from_risk_report(
+    risk,
+    mode="auto",           # Only protect capabilities your task depends on AND are at risk
+    min_dependency=0.2,    # Don't protect capabilities with dependency < 0.2
+    min_risk="MEDIUM",     # Don't protect capabilities below MEDIUM risk
+)
+
+# Or the one-liner:
+callback = SentinelCallback.auto(model, training_data, protect="smart")
+# → internally: profiles, predicts, computes dependencies, protects only what matters
+```
+
+**CLI:**
+```bash
+# "What does my task depend on?"
+sentinel deps --profile profile.sentinel --training-data ./data.jsonl
+
+# "Protect only what matters"
+sentinel train --profile profile.sentinel --protect auto \
+    -- python train.py --config config.yaml
 ```
 
 ## 5.3 The `RiskReport` Object
@@ -987,6 +1067,12 @@ class CapabilityRisk:
     confidence: float                      # 0.0 to 1.0 — prediction confidence
     subspace_overlap: float                # Raw cosine overlap between training & capability subspaces
     contributing_examples: List[ExampleRisk]  # Top examples contributing to this risk
+    
+    # Dependency analysis — does your task actually need this capability?
+    dependency_score: float                # 0.0 to 1.0 — how much your task relies on this
+    dependency_level: Literal["NONE", "WEAK", "MODERATE", "STRONG"]
+    dependency_reason: str                 # Human-readable explanation
+    protect_priority: float                # risk_score × dependency_score — what to actually protect
 
 @dataclass
 class ExampleRisk:
@@ -1011,6 +1097,10 @@ class RiskReport:
     recommendation: str                    # GO / CAUTION / STOP
     suggested_protections: Dict[str, float]  # capability → suggested β (protection strength)
     suggested_removals: List[int]          # Example IDs to consider removing
+    
+    # Dependency-aware recommendations
+    auto_protect: Dict[str, float]         # capability → β, only for caps with high (risk × dependency)
+    skip_protect: List[str]                # Capabilities at risk but your task doesn't need them
     
     # Metadata
     model_name: str
@@ -2538,6 +2628,19 @@ sentinel/
 | 6 | VLM support (Qwen2.5-VL, LLaVA-Next). Automated capability discovery. Safety hardened mode. | 85 |
 | 7 | Federated calibration. CI/CD GitHub Action. Paper 2 (prevention) draft. Smart subset data surgery. | 90 |
 | 8 | Paper 2 submission. Full API stabilization. `sentinel-lm v1.0.0`. LLaMA-Factory integration. Comprehensive docs. Paper 3 (attribution) draft. | 100 |
+
+## Phase 5: Test-Time & Inference (Level 100+) — Months 9–12
+
+Extending Sentinel beyond training into test-time and deployment.
+
+| Month | Deliverable | Level |
+|---|---|---|
+| 9 | **Test-time training (TTT) protection.** Apply gradient projection during test-time adaptation (TENT, TTT, prompt tuning at inference). Same SentinelCallback protects capabilities when the model adapts on-the-fly to new inputs. | 105 |
+| 10 | **Inference-time capability probes.** Lightweight representational drift detection for deployed models — run LiveMonitor's loss-based probes on a schedule against production checkpoints. Sub-1s per capability, no generation needed. Alert via webhook if a deployed model's capabilities have drifted past threshold. | 110 |
+| 11 | **Adaptive inference & LoRA rollback.** If drift is detected post-deployment, Sentinel triggers re-profiling and recommends or auto-executes LoRA adapter rollback to the last known-good checkpoint. Integration with vLLM and TGI serving stacks. | 115 |
+| 12 | **Test-time compute monitoring.** For models using test-time compute scaling (chain-of-thought, best-of-N), monitor whether CoT reasoning quality degrades on capability-specific inputs. Detect when scaling compute no longer compensates for capability regression. Paper 4 (test-time regression) draft. | 120 |
+
+**Exit criteria:** Sentinel covers the full model lifecycle — training, deployment, and inference. Production-grade monitoring with <100ms probe latency. TTT protection validated on 3+ adaptation methods.
 
 ---
 

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel-lm"
+version = "0.0.1"
+description = "Prediction, prevention, and diagnosis of capability regression during LLM fine-tuning"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Sentinel contributors" }]
+license = { text = "Apache-2.0" }
+dependencies = [
+    "numpy>=1.23",
+    "torch>=2.1",
+    "peft>=0.10",
+    "transformers>=4.40",
+    "safetensors>=0.4",
+]
+
+[project.scripts]
+sentinel = "sentinel.cli.main:app"
+
+[project.optional-dependencies]
+gpu = [
+    "flash-attn>=2.5",
+]
+train = [
+    "trl>=0.9",
+    "datasets>=2.19",
+]
+wandb = [
+    "wandb>=0.16",
+]
+all = [
+    "sentinel-lm[gpu,train,wandb]",
+    "typer>=0.9",
+    "rich>=13.0",
+]
+test = [
+    "pytest>=8.0",
+]
+dev = [
+    "sentinel-lm[all,test]",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sentinel*"]
