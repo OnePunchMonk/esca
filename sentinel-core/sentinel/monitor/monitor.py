@@ -102,7 +102,7 @@ class LiveMonitor:
                 rec = ""
 
             alert = MonitorAlert(
-                timestamp=datetime.utcnow().isoformat(),
+                timestamp=datetime.now(tz=__import__("datetime").timezone.utc).isoformat(),
                 step=step,
                 severity=severity,
                 capability=cap_name,

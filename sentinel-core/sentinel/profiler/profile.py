@@ -48,7 +48,7 @@ class CapabilityProfile:
     capability_names: list[str] = field(default_factory=list)
 
     # Metadata
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=lambda: datetime.now(tz=__import__("datetime").timezone.utc).isoformat())
     sentinel_version: str = "0.0.1"
     compute_time_seconds: float = 0.0
     device_info: str = ""
